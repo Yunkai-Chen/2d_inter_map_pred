@@ -560,18 +560,27 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
-    # LR schedule: warmup + cosine tail
+    # === Warmup + CosineAnnealingWarmRestarts ===
+    from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+
     steps_per_epoch = max(1, len(loader_train))
-    total_steps = steps_per_epoch * args.epochs
-    def lr_lambda(step):
-        warm = max(1, args.lr_warmup_steps)
-        if step < warm:
-            return float(step + 1) / float(warm)
-        prog = float(step - warm) / float(max(1, total_steps - warm))
-        from math import pi, cos
-        min_ratio = max(0.0, min(1.0, args.lr_min_ratio))
-        return min_ratio + 0.5 * (1.0 - min_ratio) * (1.0 + cos(pi * prog))
-    scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    warmup_steps = args.lr_warmup_steps
+
+    # 周期长度设为若干个 step，建议用 step，而不是 epoch
+    T_0 = steps_per_epoch * 5       # 第一个周期 = 5 个 epoch 的 step 数
+    T_mult = 2                      # 每次周期翻倍
+    eta_min = args.lr * args.lr_min_ratio
+
+    scheduler = CosineAnnealingWarmRestarts(
+        opt,
+        T_0=T_0,
+        T_mult=T_mult,
+        eta_min=eta_min
+    )
+
+   
+
+
 
     start_epoch = 1
     best_val = math.inf
@@ -695,7 +704,18 @@ def main():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
-            if scheduler is not None: scheduler.step()
+            # ---- Warmup 阶段：线性上升 ----
+            if global_step < warmup_steps:
+                lr = args.lr * (global_step + 1) / warmup_steps
+                for pg in opt.param_groups:
+                    pg["lr"] = lr
+            else:
+                # ---- WarmRestarts：按 global_step 触发周期 ----
+                # 正确调用方式：传入 “warmup 后的 step 数”
+                scheduler.step(global_step - warmup_steps)
+
+
+
             global_step += 1
 
             # logging
@@ -707,11 +727,14 @@ def main():
                 except: pass
                 print(log_line)
 
+
+
             if is_main_process() and wandb is not None and wandb.run is not None:
                 logdic = {"train/loss": float(loss), "epoch": epoch, "step": global_step}
-                try: logdic["train/lr"] = opt.param_groups[0]["lr"]
-                except: pass
+                current_lr = opt.param_groups[0]["lr"]
+                logdic["train/lr"] = current_lr
                 wandb.log(logdic, step=global_step)
+
 
             if is_main_process() and args.ckpt_every_steps and (global_step % args.ckpt_every_steps == 0):
                 state_dict = (model.module if isinstance(model, DDP) else model).state_dict()

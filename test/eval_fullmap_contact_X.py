@@ -116,7 +116,7 @@ def mcc(tp, fp, fn, tn):
 
 
 def sweep_pr(prob, gt, mask):
-    """Compute PR-AUC and ROC-AUC with a simple threshold sweep."""
+    """Compute PR-AUC and ROC-AUC with stable sorting + precision envelope."""
     prob = np.asarray(prob).ravel()
     gt = (np.asarray(gt) > 0.5).astype(int).ravel()
     mask = np.asarray(mask, dtype=bool).ravel()
@@ -127,24 +127,41 @@ def sweep_pr(prob, gt, mask):
     if p.size == 0 or y.sum() == 0 or y.sum() == y.size:
         return float("nan"), float("nan")
 
-    ths = np.linspace(0.0, 1.0, 101)
-    prec, rec, fpr, tpr = [], [], [], []
-    for th in ths:
-        pred = (p >= th)
-        tp = np.sum(pred & (y == 1))
-        fp = np.sum(pred & (y == 0))
-        fn = np.sum((~pred) & (y == 1))
-        tn = np.sum((~pred) & (y == 0))
-        prec.append(safe_div(tp, tp + fp))
-        rec.append(safe_div(tp, tp + fn))
-        tpr.append(safe_div(tp, tp + fn))
-        fpr.append(safe_div(fp, fp + tn))
+    # sort by descending prob (same as sklearn)
+    order = np.argsort(-p)
+    p_sorted = p[order]
+    y_sorted = y[order]
 
-    prec, rec = np.array(prec), np.array(rec)
-    auprc = float(np.trapz(y=prec, x=rec))
-    tpr, fpr = np.array(tpr), np.array(fpr)
+    # cumulative TP / FP
+    tp_cum = np.cumsum(y_sorted == 1).astype(float)
+    fp_cum = np.cumsum(y_sorted == 0).astype(float)
+    P = float((y == 1).sum())
+    N = float((y == 0).sum())
+
+    recall = tp_cum / max(P, 1e-8)
+    precision = tp_cum / np.maximum(tp_cum + fp_cum, 1e-8)
+
+    # ---- precision envelope (monotone decreasing) ----
+    precision = np.maximum.accumulate(precision[::-1])[::-1]
+
+    # ensure recall monotonic increasing before integration
+    order_r = np.argsort(recall)
+    recall = recall[order_r]
+    precision = precision[order_r]
+
+    # AUPRC
+    auprc = float(np.trapz(y=precision, x=recall))
+
+    # ROC
+    tpr = tp_cum / max(P, 1e-8)
+    fpr = fp_cum / max(N, 1e-8)
+    fpr, tpr = np.array(fpr), np.array(tpr)
+    order_f = np.argsort(fpr)
+    fpr, tpr = fpr[order_f], tpr[order_f]
     auroc = float(np.trapz(y=tpr, x=fpr))
+
     return auprc, auroc
+
 
 
 def curve_points(prob, gt, mask, num=400):
