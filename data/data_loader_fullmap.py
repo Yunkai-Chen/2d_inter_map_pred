@@ -127,20 +127,21 @@ def load_gt_full(
     pep_intra  = D_full[:Tl_cap, :Tl_cap]
     prot_intra = D_full[p_len:p_len+Tp_cap, p_len:p_len+Tp_cap]
     inter      = D_full[:Tl_cap, p_len:p_len+Tp_cap]
-
+    inter_t    = D_full[p_len:p_len+Tp_cap, :Tl_cap]
+    
     full_map = np.full((T_cap, T_cap), np.nan, dtype=np.float32)
-    mask_map = np.zeros((T_cap, T_cap), dtype=bool)
+    mask_map = np.zeros((gt_cap_pep+gt_cap_pro+4, gt_cap_pep+gt_cap_pro+4), dtype=bool)
     full_map[:Tl_cap, :Tl_cap] = pep_intra
-    full_map[p_len:p_len+Tp_cap, p_len:p_len+Tp_cap] = prot_intra
-    full_map[:Tl_cap, p_len:p_len+Tp_cap] = inter
-    full_map[p_len:p_len+Tp_cap, :Tl_cap] = inter.T
-    mask_map[:Tl_cap, :Tl_cap] = True
-    mask_map[p_len:p_len+Tp_cap, p_len:p_len+Tp_cap] = True
-    mask_map[:Tl_cap, p_len:p_len+Tp_cap] = True
-    mask_map[p_len:p_len+Tp_cap, :Tl_cap] = True
+    full_map[Tl_cap:, Tl_cap:] = prot_intra
+    full_map[:Tl_cap, Tl_cap:] = inter
+    full_map[Tl_cap:, :Tl_cap] = inter_t 
+    mask_map[1:Tl_cap+1, 1:Tl_cap+1] = True
+    mask_map[gt_cap_pep+3:gt_cap_pep+3+Tp_cap, gt_cap_pep+3:gt_cap_pep+3+Tp_cap] = True
+    mask_map[1:Tl_cap+1, gt_cap_pep+3:gt_cap_pep+3+Tp_cap] = True
+    mask_map[gt_cap_pep+3:gt_cap_pep+3+Tp_cap, 1:Tl_cap+1] = True
     # 关键的两步：
-    np.fill_diagonal(mask_map, False)                  # 1) 去掉对角线
-    mask_map &= np.isfinite(D_full[:T_cap, :T_cap])    # 2) 去掉 NaN 位置
+    #np.fill_diagonal(mask_map, False)                  # 1) 去掉对角线
+    #mask_map &= np.isfinite(full_map)   # 2) 去掉 NaN 位置
 
     if as_contact:
         finite = np.isfinite(full_map)

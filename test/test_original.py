@@ -10,11 +10,11 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt  # 用于热图
 
 # 项目内导入
-from contrasive_learning.data.data_loader import (
+from contrasive_learning.data.data_loader_inter import (
     read_db_index, read_split_list, ProtPepFullTokenDataset, collate_full_tokens,
     read_gt_index, strip_suffix_key
 )
-from contrasive_learning.model.models import PairwiseModel, PairModelConfig, PairwiseCriterion
+from contrasive_learning.model.models_final_inter import PairwiseModel, PairModelConfig, PairwiseCriterion
 
 
 # ---------------------------
@@ -388,7 +388,7 @@ def main():
 
     # 模型 / 权重
     ap.add_argument("--weights", type=str, required=True, help="path to best.pt / last.pt")
-    ap.add_argument("--head", choices=["bilinear","mlp"], default=None)
+    ap.add_argument("--head", choices=["bilinear","mlp","axial"], default=None)
     ap.add_argument("--d-model", type=int, default=1536)
     ap.add_argument("--d-proj", type=int, default=256)
     ap.add_argument("--mlp-hidden", type=int, default=512)

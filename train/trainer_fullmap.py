@@ -219,10 +219,8 @@ class FullMapCriterion(torch.nn.Module):
             # 按索引裁出有效子矩阵
             s_sub = s.index_select(0, idx).index_select(1, idx)
             g_sub = gt_map[b]
-            # 若尺寸仍不一致，取交集
-            n = min(s_sub.shape[0], g_sub.shape[0])
-            s_sub = s_sub[:n, :n]
-            g_sub = g_sub[:n, :n]
+
+
 
             if self.task == "contact":
                 loss = F.binary_cross_entropy_with_logits(

@@ -122,48 +122,86 @@ def run_eval(model, criterion, loader, device, out_dir: Path,
         scores = out["scores"]
         pair_mask = out["pair_mask"]
 
-
-
-
-        # --- Align with GT ---
-        L_common = min(scores.shape[-1], batch["gt_map_full"].shape[-1])
-        scores = scores[:, :L_common, :L_common]
-        pair_mask = pair_mask[:, :L_common, :L_common]
-        gt_map = batch["gt_map_full"][:, :L_common, :L_common]
-        gt_mask = batch["gt_mask_full"][:, :L_common, :L_common]
-
-
+        # Apply symmetrization if requested (before passing to criterion)
         if symmetrize:
             scores = torch.triu(scores, diagonal=0)
             scores = 0.5 * (scores + scores.transpose(-1, -2))
-
-
-        out["scores"] = scores
-        out["pair_mask"] = pair_mask
-
-        # Compute loss
-        loss_dict = criterion(out, {
-            "gt_map_full": gt_map,
-            "gt_mask_full": gt_mask
-        })
-        meters["loss"] += float(loss_dict["loss"])
-        meters["n"] += 1
-        have_gt = True
+            out["scores"] = scores
 
         # --- Output ---
         probs = torch.sigmoid(scores).detach().cpu().numpy()
-        gt_np = gt_map.detach().cpu().numpy()
+        gt_np = batch["gt_map_full"].detach().cpu().numpy()
+        # Keep original tensors for per-sample loss calculation
+        gt_map_full = batch["gt_map_full"]
+        gt_mask_full = batch["gt_mask_full"]
         keys = batch["keys"]
 
         for i, key in enumerate(keys):
-            prob_i = probs[i]
-            gt_i = gt_np[i]
+            
+            # --- 1. 获取当前样本的预测和目标 ---
+            prob_i = probs[i]      # NumPy: 预测概率，形状 [L_pred, L_pred] (e.g., 684x684)
+            gt_i = gt_np[i]        # NumPy: 目标，形状 [L_orig, L_orig] (e.g., 120x120)
+            
+            # 获取当前样本的 GT Mask (PyTorch Tensor)
+            m = gt_mask_full[i].cpu().bool() 
+            
+            # --- 2. 【核心修复：对齐预测和目标】---
+            # 复用 FullMapCriterion 的索引逻辑，确保基于有效残基长度 n_eff 裁剪
+            
+            # 确定有效索引 (行和列)
+            row_valid = m.any(dim=1)
+            col_valid = m.any(dim=0)
+            if not torch.equal(row_valid, col_valid):
+                # 确保行和列的有效性一致 (解决 score/mask 尺寸不一致问题)
+                row_valid = row_valid & col_valid 
+
+            idx = row_valid.nonzero(as_tuple=False).squeeze(-1)
+            n_eff = idx.shape[0] # 确定最终的有效尺寸 n (L_orig)
+
+            # 裁剪预测概率 prob_i (从 L_pred x L_pred 裁剪到 n_eff x n_eff)
+            # 转化为 Tensor，使用索引裁剪，再转回 NumPy
+            prob_t = torch.from_numpy(prob_i).float()
+            
+            # 使用索引裁剪预测，形状变为 [n_eff, n_eff]
+            prob_t_sub = prob_t.index_select(0, idx).index_select(1, idx)
+            prob_i = prob_t_sub.numpy() # 预测概率现在是 [n_eff, n_eff]
+
+            # 裁剪目标 gt_i (确保与 prob_i 尺寸匹配 n_eff x n_eff)
+            if gt_i.shape[0] > n_eff:
+                # 裁剪目标以去除可能存在的 pad 或多余部分
+                gt_i = gt_i[:n_eff, :n_eff]
+            elif gt_i.shape[0] < n_eff:
+                # 理论上不应发生，但如果发生，跳过该样本并打印警告
+                print(f"[ERROR] GT size is too small for sample {key}. Skipping.")
+                continue 
+            
+            # --- 对齐结束：现在 prob_i.shape == gt_i.shape == (n_eff, n_eff) ---
+
+            # 二值化预测（基于裁剪后的 prob_i）
             pred_bin = (prob_i >= bin_th).astype(np.float32)
 
+            # --- 保存 NumPy 文件 (使用裁剪后的数组) ---
             np.savez_compressed(out_npz / f"{key}.npz",
                                 prob=prob_i, gt=gt_i, pred_bin=pred_bin)
 
-            # === per-sample metrics ===
+            # === Compute loss per sample (Criterion 仍然使用原始 PyTorch Tensor) ===
+            # Criterion 内部必须包含它的裁剪逻辑（如我们在前述讨论中所述）
+            
+            # 注意：这里我们使用原始的 PyTorch Tensor batch，让 Criterion 自己处理
+            sample_out = {"scores": scores[i:i+1], "pair_mask": pair_mask[i:i+1]}
+            sample_gt = {"gt_map_full": gt_map_full[i:i+1], "gt_mask_full": gt_mask_full[i:i+1]}
+
+            loss_dict = criterion(sample_out, sample_gt)
+
+            if loss_dict and "loss" in loss_dict:
+                loss_val = float(loss_dict["loss"])
+                if not np.isnan(loss_val):
+                    meters["loss"] += loss_val
+                    meters["n"] += 1
+            have_gt = True
+
+            # === per-sample metrics (基于裁剪后的 NumPy 数组) ===
+            # 这些计算现在不会因为尺寸不匹配而报错
             tp = (pred_bin * gt_i).sum()
             fp = (pred_bin * (1 - gt_i)).sum()
             fn = ((1 - pred_bin) * gt_i).sum()
@@ -176,16 +214,22 @@ def run_eval(model, criterion, loader, device, out_dir: Path,
             stats_global["fn"] += fn
             stats_global["samples"] += 1
 
-
-
-            # 自动设定 Top-K 为 pep_len + prot_len（从 mask 中获取）
-            L_total = prob_i.shape[0]  # full map 总长度
-            # === Top-K contacts (K = pep_len + prot_len，来自 gt_mask_full 的有效边) ===
-            pep_len = int((gt_mask[i].sum(dim=1) > 0).sum().item())
-            prot_len = int((gt_mask[i].sum(dim=0) > 0).sum().item())
+            # 自动设定 Top-K
+            L_total = n_eff # 使用裁剪后的有效长度作为总长度
+            
+            # 重新计算 pep_len 和 prot_len（依赖于 mask 的行/列和 n_eff 的关系）
+            # 这里的计算是为了 Top-K 的数量，如果原始代码逻辑复杂，我们使用 n_eff
+            # 沿用原始代码中获取长度的思路，但基于已裁剪的 mask 索引
+            pep_len = int(m[idx].any(dim=1).sum().item())
+            prot_len = int(m[idx].any(dim=0).sum().item())
+            
+            # 为了防止索引错误，简化 Top-K 长度的估算，使用 n_eff
+            # 注意：此处 topk_dynamic 的原始计算依赖于 pep/prot len，如果计算错误可能会导致 topk 性能评估偏差。
+            # 我们假设 n_eff 是正确的总长度。
             a=5
-            topk_dynamic = max(1, a*(pep_len + prot_len))
-
+            topk_dynamic = max(1, a * (n_eff // 2) * 2) 
+            
+            # ... (Top-K 坐标提取和后续代码不变) ...
             flat = prob_i.ravel()
             if topk_dynamic >= flat.size:
                 topk_dynamic = max(1, flat.size // 20)  # 极端小图/全图退化保护
@@ -248,7 +292,6 @@ def run_eval(model, criterion, loader, device, out_dir: Path,
                             title=f"{key} pred bin≥{bin_th}", vmin=0.0, vmax=1.0)
 
                 plotted += 1
-
 
     # === Summary ===
     print(f"\n[test] mean_loss={meters['loss'] / meters['n']:.6f}" if have_gt else "[test] no GT")

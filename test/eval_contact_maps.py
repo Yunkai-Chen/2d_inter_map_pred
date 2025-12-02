@@ -267,8 +267,8 @@ def load_contact_npz(path):
         
         prob = raw
 
-    #elif "scores" in keys:
-    #    prob = sigmoid(data["scores"])
+    elif "scores" in keys:
+        prob = sigmoid(data["scores"])
     elif "distance" in keys:
         prob = None
     gt = data["gt_map"] if "gt_map" in keys else None
