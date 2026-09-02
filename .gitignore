@@ -1,0 +1,47 @@
+# 大的 embedding / 中间结果
+esm_npz/
+esmc_npz/
+runs/
+weights/
+
+# 大的样本文件
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.h5
+
+# Python 生成文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# 虚拟环境
+.env/
+.venv/
+venv/
+env/
+
+# IDE 配置
+.vscode/
+.idea/
+
+
+
+# 评测/实验输出目录（自动生成，量大非源码）
+test/outputs/
+benchmarks/outputs/
+
+# 数据/结果文件（自动生成，非源码，已抽样确认无脚本混入）
+*.png
+*.json
+*.txt
+*.a3m
+*.pdb
+*.fasta
+*.m8
+*.bibtex
+*.gz
