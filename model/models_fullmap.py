@@ -470,9 +470,14 @@ class PairwiseModelFullMap(nn.Module):
             chain_id = chain_id.to(emb.device)
             emb = emb + self.chain_embed(chain_id)   # [B, L, D]
 
-        scores = self.head(emb)          # [B, L, L]
-        sT = scores.transpose(-1, -2)
-        scores = 0.5*(scores+sT)
+        scores = self.head(emb)          # [B, L, L] or [B, L, L, C]
+        if scores.ndim == 3:
+            sT = scores.transpose(-1, -2)
+        elif scores.ndim == 4:
+            sT = scores.transpose(1, 2)  # swap the two spatial dims, keep channel
+        else:
+            raise RuntimeError(f"Unexpected score shape {scores.shape}")
+        scores = 0.5 * (scores + sT)
         pair_mask = mask[:, :, None] & mask[:, None, :] if mask is not None else None
         return {"scores": scores, "pair_mask": pair_mask}
 

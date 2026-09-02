@@ -116,6 +116,7 @@ def load_esm3_model(device: str):
         else:
             device_used = "cpu"
         model = ESM3_sm_open_v0(device_used)
+        model = model.float()  # ensure float32; newer ESM3 loads as bfloat16
         toks = get_esm3_model_tokenizers()
         return model, toks, device_used
     except Exception as e:
@@ -178,12 +179,92 @@ def forward_chain_all_tokens_esm3(model, tokenizers, seq_used: str, device_used:
 
 # --------------------------- ESMC ---------------------------
 
+def _patch_esm_checkpoint_loader():
+    """
+    esm==3.3.0's ESMC_*_202412() builds its model via init_empty_weights() (meta device),
+    then calls huggingface_hub.load_torch_model(model, data_root(...)) to fill it in. Two
+    independent bugs make this always fail here, regardless of local setup:
+
+    1. Path discovery: for esmc_600m/esmc_300m, the HF snapshot nests the real weights at
+       data/weights/<ckpt>.pth, but load_torch_model's directory-glob only looks directly in
+       the given dir for *.safetensors/*.bin (no recursion) -> "does not contain a valid
+       checkpoint". esmc_6b instead ships a standard top-level sharded-safetensors layout
+       (model-0000X-of-N.safetensors + model.safetensors.index.json), so this part works.
+    2. assign=True: both huggingface_hub's single-file and its _load_sharded_checkpoint path
+       call model.load_state_dict(state_dict, strict=...) WITHOUT assign=True, and neither
+       exposes a way to pass it through. Since the model's params are on the meta device,
+       this silently no-ops (params stay meta) instead of raising -- the failure only
+       surfaces later as "Cannot copy out of meta tensor" when .to(device) is called.
+
+    Fix: replace esm.pretrained's bound name with a loader that handles both the nested
+    single-.pth case and the sharded-safetensors-index case directly, always with
+    assign=True.
+    """
+    import esm.pretrained as _esm_pretrained
+
+    if getattr(_esm_pretrained, "_patched_for_meta_assign", False):
+        return
+
+    def _patched_load_torch_model(model, checkpoint_path, **kwargs):
+        strict = kwargs.get("strict", False)
+        p = Path(checkpoint_path)
+
+        if p.is_file():
+            sd = torch.load(p, map_location="cpu", weights_only=True)
+            return model.load_state_dict(sd, strict=strict, assign=True)
+
+        # Directory: single nested .pth (esmc_600m/esmc_300m layout)
+        pth_candidates = list(p.glob("**/*.pth"))
+        if len(pth_candidates) == 1:
+            sd = torch.load(pth_candidates[0], map_location="cpu", weights_only=True)
+            return model.load_state_dict(sd, strict=strict, assign=True)
+
+        # Directory: sharded safetensors with a top-level index (esmc_6b layout).
+        # Checkpoint keys are prefixed (e.g. "esmc.embed.weight") and use an older module
+        # name ("lm_head" -> the model's "sequence_head") vs. the live model's own names;
+        # verified this two-rule remap gives a full 1:1 match against model param names.
+        index_path = p / "model.safetensors.index.json"
+        if index_path.is_file():
+            from safetensors.torch import load_file
+
+            def _remap_key(k: str) -> str:
+                if k.startswith("esmc."):
+                    k = k[len("esmc."):]
+                if k.startswith("lm_head."):
+                    k = "sequence_head." + k[len("lm_head."):]
+                return k
+
+            with open(index_path) as f:
+                index = json.load(f)
+            shard_files = sorted(set(index["weight_map"].values()))
+            for shard_file in shard_files:
+                shard_sd = load_file(str(p / shard_file))
+                shard_sd = {_remap_key(k): v for k, v in shard_sd.items()}
+                model.load_state_dict(shard_sd, strict=False, assign=True)
+            remaining_meta = [n for n, prm in model.named_parameters() if prm.is_meta]
+            if remaining_meta:
+                raise RuntimeError(
+                    f"_patched_load_torch_model: {len(remaining_meta)} params still on meta "
+                    f"device after loading all shards, e.g. {remaining_meta[:5]}"
+                )
+            return None
+
+        raise ValueError(
+            f"_patched_load_torch_model: couldn't find a recognized checkpoint layout under {p} "
+            f"(looked for a single nested .pth and for model.safetensors.index.json)"
+        )
+
+    _esm_pretrained.load_torch_model = _patched_load_torch_model
+    _esm_pretrained._patched_for_meta_assign = True
+
+
 def load_esmc_model(device: str, ckpt_name: str = "esmc_600m", cuda_id: int = 0):
     """
     ESMC: esmc_300m / esmc_600m / esmc_6b (视可用性)
     返回 (model, device_used)
     """
     try:
+        _patch_esm_checkpoint_loader()
         from esm.models.esmc import ESMC
     except Exception as e:
         raise RuntimeError(f"Failed to import ESMC. pip install esm (>=3.x). Error: {e}")
@@ -195,7 +276,17 @@ def load_esmc_model(device: str, ckpt_name: str = "esmc_600m", cuda_id: int = 0)
 
     if device_used == "cuda":
         torch.cuda.set_device(cuda_id)
-        model = ESMC.from_pretrained(ckpt_name).to(f"cuda:{cuda_id}")
+        if "6b" in ckpt_name.lower():
+            # ESMC.from_pretrained(device=None) auto-detects cuda and moves the model
+            # there in fp32 *before* its own later bf16 cast, so the OOM (6B params,
+            # ~24GB fp32, no headroom on a 24GB GPU) happens inside that call, before we
+            # get control back. Force it to build on CPU, cast to bf16 there (halves
+            # footprint), then move the already-halved tensors to GPU.
+            model = ESMC.from_pretrained(ckpt_name, device=torch.device("cpu"))
+            model = model.to(torch.bfloat16)
+        else:
+            model = ESMC.from_pretrained(ckpt_name)
+        model = model.to(f"cuda:{cuda_id}")
         print(f"Using cuda:{cuda_id} -> {torch.cuda.get_device_name(cuda_id)}")
     else:
         model = ESMC.from_pretrained(ckpt_name).to("cpu")
@@ -217,10 +308,13 @@ def forward_chain_all_tokens_esmc(model, seq_used: str, device_used: str):
     protein = ESMProtein(sequence=seq_used)
     pt = model.encode(protein)
     out = model.logits(pt, LogitsConfig(sequence=True, return_embeddings=True))
-    emb = out.embeddings  # torch.Tensor [T,D] 或 [D,T]
+    emb = out.embeddings  # torch.Tensor [T,D] or [1,T,D] (ESM >= 3.1.4 returns 3D)
     if emb.is_cuda:
         emb = emb.cpu()
     embedding = emb.float().numpy()
+    # ESM 3.1.4+ returns (1, T, D) — squeeze batch dim
+    if embedding.ndim == 3 and embedding.shape[0] == 1:
+        embedding = embedding[0]
     L = len(seq_used)
     T = embedding.shape[0] if embedding.ndim == 2 else None  # ensure_TD 统一
 
@@ -359,9 +453,16 @@ def process_one_key(
     if print_shapes:
         print(f"[{key}] protein emb {p_emb.shape}, tokens {len(p_tokens_str)} | peptide emb {l_emb.shape}, tokens {len(l_tokens_str)}")
 
-    # 标记 padding
+    # Fix residue_mask_real: ESM3 forward sets it to the full padded length;
+    # override to mark only the true (non-X-padded) residue positions.
     p_has_cls = (p_cls_idx == 0)
     l_has_cls = (l_cls_idx == 0)
+    p_residue_mask_real = np.zeros(len(p_emb), dtype=bool)
+    p_residue_mask_real[1 if p_has_cls else 0: (1 if p_has_cls else 0) + len(prot_raw)] = True
+    l_residue_mask_real = np.zeros(len(l_emb), dtype=bool)
+    l_residue_mask_real[1 if l_has_cls else 0: (1 if l_has_cls else 0) + len(pep_raw)] = True
+
+    # 标记 padding
     mark_padding_on_token_axis(p_is_padding, p_residue_mask_real, len(prot_raw), len(prot_used), p_has_cls)
     mark_padding_on_token_axis(l_is_padding, l_residue_mask_real, len(pep_raw),  len(pep_used),  l_has_cls)
 
@@ -490,6 +591,66 @@ def process_one_key(
     }
 
 
+# --------------------------- multi-GPU worker ---------------------------
+
+def worker_process(
+    worker_id: int,
+    gpu_id: int,
+    keys_shard: List[str],
+    all_data: Dict[str, Any],
+    args,
+    out_dir: Path,
+):
+    """Single-GPU worker process. Handles its assigned shard of keys."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    if args.model == "esm3":
+        model, tokenizers, device_used = load_esm3_model("cuda")
+        tok_or_none = tokenizers
+        print(f"[GPU{gpu_id}] ESM3-open ready on {device_used}")
+    else:
+        model, device_used = load_esmc_model("cuda", ckpt_name=args.esmc_ckpt, cuda_id=0)
+        tok_or_none = None
+        print(f"[GPU{gpu_id}] ESMC ready on {device_used}")
+
+    worker_idx_path = out_dir / f"batch_index_gpu{worker_id}.json"
+    worker_idx: Dict[str, Any] = {"processed": {}, "errors": {}}
+
+    suffix = "esm3" if args.model == "esm3" else "esmc"
+    todo = [k for k in keys_shard if not (out_dir / f"{k}_{suffix}_alltokens.npz").exists()]
+
+    with tqdm(total=len(todo), desc=f"GPU{gpu_id}", position=worker_id, leave=True) as pbar:
+        for k in todo:
+            try:
+                res = process_one_key(
+                    key=k,
+                    item=all_data[k],
+                    out_dir=out_dir,
+                    model_type=args.model,
+                    model=model,
+                    tokenizers_or_None=tok_or_none,
+                    device_used=device_used,
+                    order=args.order,
+                    pad_protein=args.pad_protein,
+                    pad_peptide=args.pad_peptide,
+                    dtype=args.dtype,
+                )
+                worker_idx["processed"][k] = res
+            except Exception as e:
+                worker_idx["errors"][k] = {"error": f"{type(e).__name__}: {e}",
+                                           "traceback": traceback.format_exc(limit=3)}
+            finally:
+                pbar.update(1)
+            n_done = len(worker_idx["processed"])
+            if args.checkpoint_every and n_done > 0 and n_done % args.checkpoint_every == 0:
+                with open(worker_idx_path, "w", encoding="utf-8") as f:
+                    json.dump(worker_idx, f)
+
+    with open(worker_idx_path, "w", encoding="utf-8") as f:
+        json.dump(worker_idx, f)
+    print(f"[GPU{gpu_id}] Done. processed={len(worker_idx['processed'])}, errors={len(worker_idx['errors'])}")
+
+
 # --------------------------- main ---------------------------
 
 def parse_only_keys(s: str) -> List[str]:
@@ -509,10 +670,12 @@ def main():
     ap.add_argument("--model", choices=["esm3", "esmc"], default="esm3", help="Use ESM3-open or ESMC")
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     ap.add_argument("--cuda-id", type=int, default=0, help="CUDA device index when --device=cuda or auto & cuda is available")
+    ap.add_argument("--gpu-ids", type=int, nargs="+", default=None,
+                    help="Multi-GPU: specify GPU IDs e.g. --gpu-ids 0 1 2 3. Each GPU runs one process.")
     ap.add_argument("--esmc-ckpt", type=str, default="esmc_600m", help="ESMC checkpoint name")
 
     # 编码/前处理
-    ap.add_argument("--order", choices=["protein_peptide", "peptide_protein"], default="protein_peptide")
+    ap.add_argument("--order", choices=["protein_peptide", "peptide_protein"], default="peptide_protein")
     ap.add_argument("--pad-protein", type=int, default=None)
     ap.add_argument("--pad-peptide", type=int, default=None)
     ap.add_argument("--dtype", choices=["float32", "float16"], default="float32")
@@ -599,7 +762,58 @@ def main():
             print(f"  ... and {len(todo) - 20} more")
         return
 
-    # load model once
+    start = time.time()
+
+    # ---- multi-GPU branch ----
+    if args.gpu_ids and len(args.gpu_ids) >= 1:
+        import multiprocessing as mp
+        try:
+            mp.set_start_method("spawn", force=True)
+        except RuntimeError:
+            pass  # already set
+
+        n = len(args.gpu_ids)
+        shards = [todo[i::n] for i in range(n)]
+        print(f"Multi-GPU mode: {n} GPUs {args.gpu_ids}, "
+              f"{len(todo)} todo keys split ~{len(todo)//n} each")
+
+        processes = []
+        for i, (gpu_id, shard) in enumerate(zip(args.gpu_ids, shards)):
+            p = mp.Process(
+                target=worker_process,
+                args=(i, gpu_id, shard, all_data, args, out_dir),
+                daemon=False,
+            )
+            p.start()
+            processes.append(p)
+
+        for p in processes:
+            p.join()
+
+        # merge worker indexes back into main index
+        for i in range(n):
+            worker_idx_path = out_dir / f"batch_index_gpu{i}.json"
+            if worker_idx_path.exists():
+                with open(worker_idx_path, "r", encoding="utf-8") as f:
+                    w = json.load(f)
+                processed_dict.update(w.get("processed", {}))
+                errors_dict.update(w.get("errors", {}))
+                worker_idx_path.unlink()
+
+        idx["processed"] = processed_dict
+        idx["errors"] = errors_dict
+        save_index(out_dir, idx)
+
+        elapsed = time.time() - start
+        print("=" * 80)
+        print("BATCH COMPLETE (multi-GPU)")
+        print(f"Elapsed: {elapsed/60:.1f} min | GPUs: {args.gpu_ids}")
+        print(f"Total processed in index: {len(processed_dict)} | errors: {len(errors_dict)} | skipped: {len(skipped_list)}")
+        print(f"Index: {index_path(out_dir)}")
+        print("=" * 80)
+        return
+
+    # ---- single-GPU branch (original) ----
     if args.model == "esm3":
         model, tokenizers, device_used = load_esm3_model(args.device)
         tok_or_none = tokenizers
@@ -609,7 +823,6 @@ def main():
         tok_or_none = None
         print(f"✅ ESMC({args.esmc_ckpt}) ready on {device_used}")
 
-    start = time.time()
     done = 0
     total = len(todo)
 

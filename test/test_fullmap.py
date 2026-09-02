@@ -181,8 +181,13 @@ def run_eval(model, criterion, loader, device, out_dir: Path,
             pred_bin = (prob_i >= bin_th).astype(np.float32)
 
             # --- 保存 NumPy 文件 (使用裁剪后的数组) ---
-            np.savez_compressed(out_npz / f"{key}.npz",
-                                prob=prob_i, gt=gt_i, pred_bin=pred_bin)
+            if "chain_id" in batch:
+                chain_id_i = batch["chain_id"][i][idx][:n_eff].cpu().numpy()
+                np.savez_compressed(out_npz / f"{key}.npz",
+                                    prob=prob_i, gt=gt_i, pred_bin=pred_bin, chain_id=chain_id_i)
+            else:
+                np.savez_compressed(out_npz / f"{key}.npz",
+                                    prob=prob_i, gt=gt_i, pred_bin=pred_bin)
 
             # === Compute loss per sample (Criterion 仍然使用原始 PyTorch Tensor) ===
             # Criterion 内部必须包含它的裁剪逻辑（如我们在前述讨论中所述）

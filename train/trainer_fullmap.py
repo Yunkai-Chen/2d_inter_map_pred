@@ -261,6 +261,138 @@ class FullMapCriterion(torch.nn.Module):
     
 
 # ---------------------------
+# Region-wise metrics computation
+# ---------------------------
+def compute_region_metrics(scores, gt_map, gt_mask, chain_id, threshold=0.5):
+    """
+    Compute precision, recall, F1, accuracy for 4 regions:
+      - pep_intra: peptide internal (exclude diagonal)
+      - prot_intra: protein internal (exclude diagonal)
+      - inter: peptide-protein interaction (both directions)
+      - overall: all valid regions
+
+    Args:
+        scores: [L, L] logits
+        gt_map: [L, L] binary ground truth
+        gt_mask: [L, L] valid region mask
+        chain_id: [L] 0 for peptide, 1 for protein
+        threshold: sigmoid threshold for binary prediction
+
+    Returns:
+        dict with region-wise metrics
+    """
+    # Convert logits to probabilities
+    probs = torch.sigmoid(scores)
+    preds = (probs > threshold).float()
+
+    # Find peptide length
+    pep_mask = (chain_id == 0)
+    pep_len = int(pep_mask.sum().item())
+    total_len = chain_id.shape[0]
+
+    # Initialize accumulators for each region
+    regions = {
+        'pep_intra': {'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0},
+        'prot_intra': {'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0},
+        'inter': {'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0},
+        'overall': {'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0},
+    }
+
+    # Helper to accumulate stats
+    def accumulate_stats(pred_region, gt_region, mask_region, stats_dict):
+        valid = mask_region.bool()
+        if valid.sum() == 0:
+            return
+
+        pred_valid = pred_region[valid]
+        gt_valid = gt_region[valid]
+
+        tp = int(((pred_valid == 1) & (gt_valid == 1)).sum().item())
+        fp = int(((pred_valid == 1) & (gt_valid == 0)).sum().item())
+        tn = int(((pred_valid == 0) & (gt_valid == 0)).sum().item())
+        fn = int(((pred_valid == 0) & (gt_valid == 1)).sum().item())
+
+        stats_dict['tp'] += tp
+        stats_dict['fp'] += fp
+        stats_dict['tn'] += tn
+        stats_dict['fn'] += fn
+
+    # 1. Peptide intra region (exclude diagonal)
+    if pep_len > 0:
+        pep_intra_mask = gt_mask[:pep_len, :pep_len].clone()
+        # Exclude diagonal
+        pep_intra_mask[range(pep_len), range(pep_len)] = False
+        accumulate_stats(
+            preds[:pep_len, :pep_len],
+            gt_map[:pep_len, :pep_len],
+            pep_intra_mask,
+            regions['pep_intra']
+        )
+
+    # 2. Protein intra region (exclude diagonal)
+    if pep_len < total_len:
+        prot_len = total_len - pep_len
+        prot_intra_mask = gt_mask[pep_len:, pep_len:].clone()
+        # Exclude diagonal
+        prot_intra_mask[range(prot_len), range(prot_len)] = False
+        accumulate_stats(
+            preds[pep_len:, pep_len:],
+            gt_map[pep_len:, pep_len:],
+            prot_intra_mask,
+            regions['prot_intra']
+        )
+
+    # 3. Inter region (peptide-protein interaction, both directions)
+    if pep_len > 0 and pep_len < total_len:
+        # Upper-right block: peptide rows, protein columns
+        accumulate_stats(
+            preds[:pep_len, pep_len:],
+            gt_map[:pep_len, pep_len:],
+            gt_mask[:pep_len, pep_len:],
+            regions['inter']
+        )
+        # Lower-left block: protein rows, peptide columns
+        accumulate_stats(
+            preds[pep_len:, :pep_len],
+            gt_map[pep_len:, :pep_len],
+            gt_mask[pep_len:, :pep_len],
+            regions['inter']
+        )
+
+    # 4. Overall (all valid regions, exclude diagonal)
+    overall_mask = gt_mask.clone()
+    diag_idx = range(min(total_len, overall_mask.shape[0]))
+    overall_mask[diag_idx, diag_idx] = False
+    accumulate_stats(
+        preds,
+        gt_map,
+        overall_mask,
+        regions['overall']
+    )
+
+    # Compute metrics from accumulated stats
+    metrics = {}
+    for region_name, stats in regions.items():
+        tp, fp, tn, fn = stats['tp'], stats['fp'], stats['tn'], stats['fn']
+
+        precision = tp / max(1, tp + fp)
+        recall = tp / max(1, tp + fn)
+        f1 = 2 * precision * recall / max(1e-8, precision + recall)
+        accuracy = (tp + tn) / max(1, tp + tn + fp + fn)
+
+        metrics[f'{region_name}_precision'] = precision
+        metrics[f'{region_name}_recall'] = recall
+        metrics[f'{region_name}_f1'] = f1
+        metrics[f'{region_name}_accuracy'] = accuracy
+        metrics[f'{region_name}_tp'] = tp
+        metrics[f'{region_name}_fp'] = fp
+        metrics[f'{region_name}_tn'] = tn
+        metrics[f'{region_name}_fn'] = fn
+
+    return metrics
+
+
+# ---------------------------
 # evaluation (full-map only)
 # ---------------------------
 @torch.no_grad()
@@ -278,12 +410,23 @@ def evaluate(model, criterion, loader, device, task: str):
     if task == "distance":
         meters["mae_sum"] = 0.0
 
+    # Initialize region-wise metric accumulators for contact task
+    if task == "contact":
+        region_stats = {
+            'pep_intra': {'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0},
+            'prot_intra': {'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0},
+            'inter': {'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0},
+            'overall': {'tp': 0, 'fp': 0, 'tn': 0, 'fn': 0},
+        }
+
     for batch in loader:
         # Move tensors to device
         batch["full_emb"]    = batch["full_emb"].to(device, non_blocking=True)
         batch["full_mask"]   = batch["full_mask"].to(device, non_blocking=True)
         batch["gt_map_full"] = batch["gt_map_full"].to(device, non_blocking=True)
         batch["gt_mask_full"]= batch["gt_mask_full"].to(device, non_blocking=True)
+        if "chain_id" in batch:
+            batch["chain_id"] = batch["chain_id"].to(device, non_blocking=True)
 
         model_batch = {
             "full_emb":  batch["full_emb"],
@@ -331,6 +474,22 @@ def evaluate(model, criterion, loader, device, task: str):
                     reduction="mean"
                 )
                 losses.append(loss.detach())
+
+                # --- 计算分区 metrics ---
+                if "chain_id" in batch:
+                    chain_id_sample = batch["chain_id"][b]
+                    # 使用原始的 scores[b] 和 gt_map[b]，不是裁剪后的
+                    sample_metrics = compute_region_metrics(
+                        scores[b],
+                        gt_map[b],
+                        gt_mask[b],
+                        chain_id_sample,
+                        threshold=0.5
+                    )
+                    # 累积各个区域的统计量
+                    for region in ['pep_intra', 'prot_intra', 'inter', 'overall']:
+                        for stat in ['tp', 'fp', 'tn', 'fn']:
+                            region_stats[region][stat] += sample_metrics[f'{region}_{stat}']
             else:
                 loss = F.huber_loss(s_sub, g_sub, delta=criterion.huber_delta, reduction="mean")
                 losses.append(loss.detach())
@@ -355,9 +514,48 @@ def evaluate(model, criterion, loader, device, task: str):
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
         meters["loss_sum"], meters["mae_sum"], meters["n"] = map(float, t.tolist())
 
+        # Aggregate region-wise stats for contact task
+        if task == "contact":
+            region_tensor_list = []
+            for region in ['pep_intra', 'prot_intra', 'inter', 'overall']:
+                region_tensor_list.extend([
+                    float(region_stats[region]['tp']),
+                    float(region_stats[region]['fp']),
+                    float(region_stats[region]['tn']),
+                    float(region_stats[region]['fn']),
+                ])
+            region_tensor = torch.tensor(region_tensor_list, dtype=torch.float32, device=device)
+            dist.all_reduce(region_tensor, op=dist.ReduceOp.SUM)
+
+            # Unpack back to region_stats
+            idx = 0
+            for region in ['pep_intra', 'prot_intra', 'inter', 'overall']:
+                region_stats[region]['tp'] = int(region_tensor[idx].item())
+                region_stats[region]['fp'] = int(region_tensor[idx + 1].item())
+                region_stats[region]['tn'] = int(region_tensor[idx + 2].item())
+                region_stats[region]['fn'] = int(region_tensor[idx + 3].item())
+                idx += 4
+
     out = {"loss": meters["loss_sum"] / max(1, meters["n"])}
     if task == "distance":
         out["mae"] = meters["mae_sum"] / max(1, meters["n"])
+
+    # Add region-wise metrics for contact task
+    if task == "contact":
+        for region in ['pep_intra', 'prot_intra', 'inter', 'overall']:
+            stats = region_stats[region]
+            tp, fp, tn, fn = stats['tp'], stats['fp'], stats['tn'], stats['fn']
+
+            precision = tp / max(1, tp + fp)
+            recall = tp / max(1, tp + fn)
+            f1 = 2 * precision * recall / max(1e-8, precision + recall)
+            accuracy = (tp + tn) / max(1, tp + tn + fp + fn)
+
+            out[f'{region}_precision'] = precision
+            out[f'{region}_recall'] = recall
+            out[f'{region}_f1'] = f1
+            out[f'{region}_accuracy'] = accuracy
+
     return out
 
 # ---------------------------
@@ -752,10 +950,27 @@ def main():
                     print(f"[epoch {epoch}] val_loss={val_m['loss']:.4f}  val_mae={val_m.get('mae',0):.4f}  (time {elapsed:.1f}s)")
                 else:
                     print(f"[epoch {epoch}] val_loss={val_m['loss']:.4f}  (time {elapsed:.1f}s)")
+                    # Print region-wise metrics for contact task
+                    if 'inter_f1' in val_m:
+                        print(f"  Region metrics:")
+                        print(f"    inter:      P={val_m['inter_precision']:.4f} R={val_m['inter_recall']:.4f} F1={val_m['inter_f1']:.4f} Acc={val_m['inter_accuracy']:.4f}")
+                        print(f"    pep_intra:  P={val_m['pep_intra_precision']:.4f} R={val_m['pep_intra_recall']:.4f} F1={val_m['pep_intra_f1']:.4f} Acc={val_m['pep_intra_accuracy']:.4f}")
+                        print(f"    prot_intra: P={val_m['prot_intra_precision']:.4f} R={val_m['prot_intra_recall']:.4f} F1={val_m['prot_intra_f1']:.4f} Acc={val_m['prot_intra_accuracy']:.4f}")
+                        print(f"    overall:    P={val_m['overall_precision']:.4f} R={val_m['overall_recall']:.4f} F1={val_m['overall_f1']:.4f} Acc={val_m['overall_accuracy']:.4f}")
 
                 if wandb is not None and wandb.run is not None:
                     logdic = {"val/loss": float(val_m["loss"]), "epoch": epoch, "step": global_step}
-                    if task == "distance" and "mae" in val_m: logdic["val/mae"] = float(val_m["mae"])
+                    if task == "distance" and "mae" in val_m:
+                        logdic["val/mae"] = float(val_m["mae"])
+
+                    # Log region-wise metrics for contact task
+                    if task == "contact" and 'inter_f1' in val_m:
+                        for region in ['pep_intra', 'prot_intra', 'inter', 'overall']:
+                            logdic[f"val/{region}_precision"] = float(val_m[f'{region}_precision'])
+                            logdic[f"val/{region}_recall"] = float(val_m[f'{region}_recall'])
+                            logdic[f"val/{region}_f1"] = float(val_m[f'{region}_f1'])
+                            logdic[f"val/{region}_accuracy"] = float(val_m[f'{region}_accuracy'])
+
                     wandb.log(logdic, step=global_step)
 
                 # save last/best

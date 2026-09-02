@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pdb_interface_to_json_singlepair.py
+data_process_generate_json.py
 
-从目录中批量读取形如 <pdbid>_<peptideid>_<proteinid>.pdb 的文件（两个链ID均为单字符），
+从目录中批量读取形如 <pdbid>_<chain1>_<chain2>__pep<pepChain>_<num>_T15_pad3.pdb 的文件，
 基于重原子最短距离 ≤ cutoff 判定界面残基，构建三套编号体系（原始PDB/分链重编号/全局重编号），
 标注未知残基（非常规三字母→X），并输出与既有流水线兼容的 JSON（含 Encoding 元信息）。
+
+仅保留标准氨基酸残基（ATOM记录，hetflag=' '），自动去除水分子、离子、小分子配体等非蛋白分子。
 
 依赖：
   pip install biopython numpy pandas scipy tqdm
 
 用法示例：
-  python pdb_interface_to_json_singlepair.py \
+  python data_process_generate_json.py \
       --pdb_dir path/to/pdbs \
       --output_dir out_json \
       --cutoff 6.0
@@ -70,19 +72,27 @@ def get_heavy_atom_coords(residue) -> np.ndarray:
 def parse_filename(fname: str):
     """
     从文件名解析 pdbid, peptide_chain, protein_chain.
-    预期：<pdbid>_<peptideid>_<proteinid>.pdb 且两个链ID均为单字符。
+    支持格式：<pdbid>_<chain1>_<chain2>__pep<pepChain>_<num>_T15_pad3.pdb
+    例如：1a0a_A_B__pepA_001_T15_pad3.pdb → pdbid=1a0a, pep_chain=A, prot_chain=B
+    pep后的字母即 peptide 链ID，另一条为 protein 链ID。
     """
     base = os.path.basename(fname)
     if not base.lower().endswith('.pdb'):
         return None
     stem = base[:-4]
-    parts = stem.split('_')
-    if len(parts) != 3:
+    # 匹配: {pdbid}_{chain1}_{chain2}__pep{pepLetter}_{num}_T15_pad3
+    m = re.match(r'^(\w+)_([A-Za-z0-9])_([A-Za-z0-9])__pep([A-Za-z0-9])_(\d+)_T\d+(?:_pad\d+)?$', stem)
+    if m is None:
         return None
-    pdbid, pep, prot = parts
-    if len(pep) != 1 or len(prot) != 1:
-        return None
-    return pdbid, pep, prot
+    pdbid, chain1, chain2, pep_letter, sample_num = m.groups()
+    # pep_letter 对应 peptide 链，另一条为 protein 链
+    if pep_letter == chain1:
+        pep_chain, prot_chain = chain1, chain2
+    elif pep_letter == chain2:
+        pep_chain, prot_chain = chain2, chain1
+    else:
+        return None  # pep字母与两条链都不匹配，跳过
+    return pdbid, pep_chain, prot_chain, stem
 
 def build_numbering_for_two_chains(structure, protein_chain_id: str, peptide_chain_id: str):
     """
@@ -96,14 +106,18 @@ def build_numbering_for_two_chains(structure, protein_chain_id: str, peptide_cha
     """
     model = list(structure.get_models())[0]
 
-    # 只收集目标链的氨基酸残基（is_aa）
+    # 只收集目标链的标准氨基酸残基，排除水、离子、小分子配体等非蛋白分子
     residues_by_chain = {protein_chain_id: [], peptide_chain_id: []}
     for chain in model:
         cid = chain.id
         if cid not in residues_by_chain:
             continue
         for res in chain:
-            if is_aa(res, standard=True) or is_aa(res, standard=False):
+            # 跳过水分子（W）和 HETATM 杂原子（H_ 开头）
+            hetflag = res.id[0]
+            if hetflag != ' ':
+                continue
+            if is_aa(res, standard=True):
                 residues_by_chain[cid].append(res)
 
     # 分链重编号：每条链从1开始
@@ -253,7 +267,7 @@ def process_one_pdb(pdb_path: str, cutoff: float):
     parsed = parse_filename(pdb_path)
     if parsed is None:
         return None, None
-    pdbid, pep_chain, prot_chain = parsed
+    pdbid, pep_chain, prot_chain, stem = parsed
 
     parser = PDBParser(QUIET=True)
     try:
@@ -304,7 +318,7 @@ def process_one_pdb(pdb_path: str, cutoff: float):
     }
 
     # 组织 JSON
-    key = f"{pdbid.lower()}_{pep_chain}_{prot_chain}_nomutation"
+    key = stem
     json_obj = {
         key: {
             "Input": {

@@ -247,11 +247,19 @@ def main():
     ap.add_argument("--root", required=True, help="folder containing outputs/")
     ap.add_argument("--subdir", default="pred_npz", help="subfolder containing *.npz")
     ap.add_argument("--meta-json", required=True, help="metadata JSON with peptide/protein lengths")
-    ap.add_argument("--prob-th", type=float, default=0.5)
+    ap.add_argument("--prob-th", type=float, default=0.5, help="Default threshold (backward compat)")
+    ap.add_argument("--prob-th-inter", type=float, default=None, help="Threshold for inter-region (peptide-protein). If None, uses --prob-th")
+    ap.add_argument("--prob-th-intra", type=float, default=None, help="Threshold for intra-region (peptide/protein). If None, uses --prob-th")
     ap.add_argument("--pairing", choices=["unique_upper", "full"], default="unique_upper",
                     help="unique_upper: only count upper-triangular unique pairs; full: use full symmetric map.")
     ap.add_argument("--save-figs", action="store_true")
     args = ap.parse_args()
+
+    # --- setup thresholds ---
+    th_inter = args.prob_th_inter if args.prob_th_inter is not None else args.prob_th
+    th_intra = args.prob_th_intra if args.prob_th_intra is not None else args.prob_th
+    th_full = args.prob_th  # for backward compatibility, full uses the default threshold
+    print(f"[config] Thresholds: full={th_full:.2f}, inter={th_inter:.2f}, intra={th_intra:.2f}")
 
     # --- load metadata ---
     with open(args.meta_json, "r") as f:
@@ -327,11 +335,11 @@ def main():
             full_mask = finite_mask(prob, gt)
 
         # ---- Compute per-region metrics ----
-        m_full  = region_metrics(prob, gt, full_mask, th=args.prob_th)
-        m_inter = region_metrics(prob, gt, inter_mask, th=args.prob_th)
-        m_pep   = region_metrics(prob, gt, intra_pep_mask, th=args.prob_th)
-        m_pro   = region_metrics(prob, gt, intra_pro_mask, th=args.prob_th)
-        m_both  = region_metrics(prob, gt, intra_both_mask, th=args.prob_th)
+        m_full  = region_metrics(prob, gt, full_mask, th=th_full)
+        m_inter = region_metrics(prob, gt, inter_mask, th=th_inter)
+        m_pep   = region_metrics(prob, gt, intra_pep_mask, th=th_intra)
+        m_pro   = region_metrics(prob, gt, intra_pro_mask, th=th_intra)
+        m_both  = region_metrics(prob, gt, intra_both_mask, th=th_intra)
 
         row = dict(
             id=key,
